@@ -1,0 +1,97 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      HAS_KEYSTORE: ${{ secrets.KEYSTORE_BASE64 != '' && secrets.KEYSTORE_PASSWORD != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Bundle Arabic font (Cairo)
+        run: |
+          mkdir -p www/fonts
+          for w in 400 700; do
+            for s in arabic latin; do
+              cp "node_modules/@fontsource/cairo/files/cairo-$s-$w-normal.woff2" www/fonts/ || echo "missing font $s $w"
+            done
+          done
+          ls -la www/fonts
+
+      - name: Add Android platform
+        run: npx cap add android
+
+      - name: Add PDF print plugin
+        run: |
+          DIR=android/app/src/main/java/com/modarasa/app
+          mkdir -p "$DIR"
+          cp native/PrinterPlugin.java native/MainActivity.java "$DIR/"
+
+      - name: Set version (increases every build)
+        run: |
+          F=android/app/build.gradle
+          sed -i -E 's/versionCode *=? *[0-9]+/versionCode ${{ github.run_number }}/' $F
+          sed -i -E 's/versionName *=? *"[^"]*"/versionName "1.0.${{ github.run_number }}"/' $F
+          grep -nE "versionCode|versionName" $F
+
+      - name: Sync web files
+        run: npx cap sync android
+
+      - name: Build signed release APK
+        if: env.HAS_KEYSTORE == 'true'
+        working-directory: android
+        env:
+          KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease
+          echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/modarasa.jks"
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          UNSIGNED=$(ls app/build/outputs/apk/release/*.apk | head -1)
+          "$BT/zipalign" -p -f 4 "$UNSIGNED" "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" sign --ks "$RUNNER_TEMP/modarasa.jks" --ks-pass env:KS_PASS \
+            --ks-key-alias modarasa --key-pass env:KS_PASS \
+            --out ../modarasa.apk "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" verify --print-certs ../modarasa.apk
+
+      - name: Build debug APK (no keystore secrets found)
+        if: env.HAS_KEYSTORE != 'true'
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug
+          cp app/build/outputs/apk/debug/app-debug.apk ../modarasa.apk
+          echo "::warning::لم يتم العثور على أسرار التوقيع. هذا APK تجريبي وغير صالح للنشر على APKPure."
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: modarasa-apk
+          path: modarasa.apk
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: مُدارسة v1.0.${{ github.run_number }}
+          files: modarasa.apk
